@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -W error -m unittest discover -s tests
+
+  exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller --onefile --noconsole --uac-admin --name AppRemover run.pyw
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AppRemover-windows
+          path: dist/AppRemover.exe
