@@ -6,6 +6,10 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to create, e.g. v0.1.0 (leave empty to only build)"
+        default: ""
 
 jobs:
   test:
@@ -33,7 +37,7 @@ jobs:
           path: dist/AppRemover.exe
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
     needs: exe
     runs-on: ubuntu-latest
     permissions:
@@ -45,7 +49,8 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.version || github.ref_name }}
         run: >
-          gh release create "$GITHUB_REF_NAME" AppRemover.exe
-          --repo "$GITHUB_REPOSITORY" --title "App Remover $GITHUB_REF_NAME"
-          --generate-notes
+          gh release create "$TAG" AppRemover.exe
+          --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
+          --title "App Remover $TAG" --generate-notes
