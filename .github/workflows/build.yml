@@ -8,37 +8,35 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag to create, e.g. v0.1.0 (leave empty to only build)"
+        description: "Release tag to create, e.g. v0.2.0 (leave empty to only build)"
         default: ""
 
 jobs:
-  test:
+  test-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -W error -m unittest discover -s tests
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib
 
   exe:
-    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install pyinstaller
-      - run: pyinstaller --onefile --noconsole --uac-admin --name AppRemover run.pyw
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --lib
+      - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
           name: AppRemover-windows
-          path: dist/AppRemover.exe
+          path: target/release/AppRemover.exe
 
   release:
     if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
-    needs: exe
+    needs: [test-linux, exe]
     runs-on: ubuntu-latest
     permissions:
       contents: write

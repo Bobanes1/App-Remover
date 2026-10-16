@@ -1,43 +1,57 @@
 # App Remover
 
-A small Revo-Uninstaller-style tool for Windows: pick a program, click **Remove**, done.
-No wizard, no menus, no Python packages to install (standard library only).
+Ein kleiner Programm-Entferner für Windows im Stil von Revo Uninstaller, geschrieben in Rust mit [egui](https://github.com/emilk/egui).
+Programm auswählen, **Remove** klicken, fertig. Kein Assistent, keine verschachtelten Menüs.
 
-## What "Remove" does
+## Was „Remove“ macht
 
-1. Stops the program's running processes (and known helper services for apps like Adobe Creative Cloud).
-2. Runs the program's own uninstaller **silently** where possible (MSI `/qn`, Inno Setup `/VERYSILENT`, or the
-   program's registered quiet command).
-3. **If the uninstaller is missing, broken or fails** (the classic *"uninstaller is unavailable"* error), it does not stop:
-   it carries on and removes the program by hand.
-4. Scans for leftovers and deletes them: install folder, matching folders in Program Files / ProgramData / AppData,
-   Start-menu and desktop shortcuts, registry keys, startup entries, services and scheduled tasks, and finally the
-   entry in Apps & Features.
-5. Registry keys are exported to `%LOCALAPPDATA%\AppRemover\backups\...` as `.reg` files before deletion.
-   Files are deleted permanently (locked files are scheduled for deletion at next restart).
+1. Beendet die laufenden Prozesse des Programms (bei Apps wie Adobe Creative Cloud auch die bekannten Hintergrunddienste).
+2. Startet den Deinstaller des Programms **still**, wo das geht (MSI `/qn`, Inno Setup `/VERYSILENT` oder der hinterlegte
+   „Quiet“-Befehl).
+3. **Fehlt der Deinstaller oder schlägt er fehl** (die typische Meldung *„Deinstallationsprogramm nicht verfügbar“*),
+   bricht es nicht ab, sondern entfernt das Programm von Hand.
+4. Sucht und löscht Reste: Installationsordner, passende Ordner in Programme / ProgramData / AppData, Startmenü- und
+   Desktop-Verknüpfungen, Registry-Schlüssel, Autostart-Einträge, Dienste, geplante Aufgaben und zum Schluss den Eintrag
+   unter „Apps & Features“.
+5. Registry-Schlüssel werden vorher als `.reg`-Dateien nach `%LOCALAPPDATA%\AppRemover\backups\...` gesichert.
+   Dateien werden endgültig gelöscht; gesperrte Dateien werden beim nächsten Neustart entfernt.
 
-Matching is deliberately conservative. Items whose name equals the program's name are deleted automatically;
-items that merely look similar are listed only if you tick **Review leftovers** (or pass `--include-medium` on the command
-line). Publisher folders such as `Adobe` are never deleted, only searched inside, so removing Creative Cloud leaves Photoshop alone.
-System folders and top-level registry keys are hard-blocked.
+Die Erkennung ist absichtlich vorsichtig. Was genau den Namen des Programms trägt, wird automatisch gelöscht; was nur
+ähnlich aussieht, wird nur angezeigt, wenn **Review leftovers** angehakt ist (oder mit `--include-medium`).
+Herstellerordner wie `Adobe` werden nie gelöscht, nur durchsucht. Wer Creative Cloud entfernt, behält also Photoshop.
+Systemordner, Laufwerkswurzeln und Registry-Hauptschlüssel sind gesperrt, und Verknüpfungen/Junctions werden beim Löschen
+nie verfolgt.
 
-## Use it
+## Bedienung
 
-Easiest: get `AppRemover.exe` from the **Actions → build → Artifacts** tab of this repo (or run `build.bat` yourself),
-and double-click it. It asks for administrator rights once.
+- Einfach lostippen: Die Suche filtert sofort, auch wenn das Suchfeld gerade nicht fokussiert ist.
+- Pfeiltasten wählen aus, **Enter** oder **Entf** (oder Doppelklick) entfernt, Enter bestätigt.
+- Spaltenköpfe anklicken sortiert (z. B. nach Größe).
 
-From source (Windows, Python 3.9+): `python -m appremover` (GUI) or
+## Herunterladen / bauen
+
+`AppRemover.exe` gibt es unter **Releases** bzw. **Actions → build → Artifacts**. Beim Start fragt Windows einmal nach
+Administratorrechten. Da die exe nicht signiert ist, warnt SmartScreen eventuell: „Weitere Informationen → Trotzdem
+ausführen“.
+
+Selbst bauen (Windows, [Rust](https://rustup.rs)): `cargo build --release` → `target\release\AppRemover.exe`
+
+Kommandozeile (in einem Administrator-Terminal):
 
 ```
-python -m appremover list adobe
-python -m appremover remove "Adobe Creative Cloud" --dry-run   # show what would happen
-python -m appremover remove "Adobe Creative Cloud"             # do it, no questions
-python -m appremover remove "Some App" --force                 # skip its uninstaller entirely
+AppRemover list adobe
+AppRemover remove "Adobe Creative Cloud" --dry-run   # nur anzeigen, was passieren würde
+AppRemover remove "Adobe Creative Cloud"             # ohne Rückfragen entfernen
+AppRemover remove "Irgendwas" --force                # Deinstaller überspringen
+AppRemover --demo                                    # Oberfläche mit erfundenen Programmen ausprobieren
 ```
 
-## Status
+## Entwicklung
 
-The logic (program discovery, uninstall-command building, leftover matching, safety guards, cleanup) is covered by
-unit tests that run on any OS (`python -m unittest discover -s tests`). The Windows calls (`winreg`, `reg`, `sc`,
-`schtasks`, `taskkill`) are thin wrappers and have **not yet been exercised on a real Windows machine**: try
-`--dry-run` first on anything you care about.
+Die gesamte Logik (Programmliste, Deinstaller-Aufruf, Reste-Erkennung, Schutzregeln, Aufräumen) liegt in der Bibliothek
+unter `src/` und wird mit `cargo test --lib` getestet (läuft auf Linux und Windows). Die Windows-Aufrufe (`winreg`,
+`reg`, `sc`, `schtasks`, `taskkill`) sind dünne Hüllen in `registry.rs` und `system.rs`.
+`AppRemover --demo` startet die Oberfläche mit einer erfundenen Registry und ändert garantiert nichts.
+
+**Stand:** Auf einem echten Windows-PC mit echten Programmen ist das Entfernen noch nicht ausprobiert worden; bei wichtigen
+Programmen zuerst `--dry-run` oder **Review leftovers** verwenden.

@@ -1,0 +1,46 @@
+[package]
+name = "app-remover"
+version = "0.2.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Fast Revo-style program uninstaller for Windows with leftover cleanup"
+
+[lib]
+name = "app_remover"
+path = "src/lib.rs"
+
+[[bin]]
+name = "AppRemover"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "system_fonts",
+    "glow",
+    "x11",
+    "wayland",
+] }
+egui_extras = "0.37"
+regex = "1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
+[build-dependencies]
+embed-manifest = "1.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
