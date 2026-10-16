@@ -365,3 +365,33 @@ fn finds_scheduled_task_in_utf16_xml() {
     let found_tasks: Vec<_> = found.iter().filter(|i| i.kind == Kind::Task).map(|i| i.target.as_str()).collect();
     assert_eq!(found_tasks, ["\\Vendor\\Updater"]);
 }
+
+#[test]
+fn program_drive_detection() {
+    use crate::disk::program_drive;
+    let mut a = prog(r#""C:\Windows\SysWOW64\uninst.exe" /x"#, "");
+    assert_eq!(program_drive(&a), None, "an uninstaller under Windows says nothing");
+    a.display_icon = r#""e:\Tools\app.exe",0"#.into();
+    assert_eq!(program_drive(&a).as_deref(), Some("E:"));
+    a.install_location = r"D:\Games\Foo".into();
+    assert_eq!(program_drive(&a).as_deref(), Some("D:"), "install folder wins");
+    let msi = prog("MsiExec.exe /X{12345678-1234-1234-1234-123456789ABC}", "");
+    assert_eq!(program_drive(&msi), None);
+    let plain = prog(r#""F:\Apps\x\uninstall.exe""#, "");
+    assert_eq!(program_drive(&plain).as_deref(), Some("F:"));
+}
+
+#[test]
+fn folder_size_counts_files_but_not_links() {
+    let f = fixture();
+    fs::write(p(&f.loc, &["big.bin"]), vec![0u8; 5000]).unwrap();
+    fs::write(p(&f.loc, &["Utils", "small.bin"]), vec![0u8; 100]).unwrap();
+    // x.dll from the fixture is empty: 5000 + 100 bytes -> 5 KB rounded up
+    assert_eq!(crate::disk::folder_size_kb(Path::new(&f.loc)), 5);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&f.photoshop, p(&f.loc, &["link"])).unwrap();
+        fs::write(p(&f.photoshop, &["huge.bin"]), vec![0u8; 50_000]).unwrap();
+        assert_eq!(crate::disk::folder_size_kb(Path::new(&f.loc)), 5);
+    }
+}

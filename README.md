@@ -26,7 +26,11 @@ nie verfolgt.
 
 - Einfach lostippen: Die Suche filtert sofort, auch wenn das Suchfeld gerade nicht fokussiert ist.
 - Pfeiltasten wählen aus, **Enter** oder **Entf** (oder Doppelklick) entfernt, Enter bestätigt.
-- Spaltenköpfe anklicken sortiert (z. B. nach Größe).
+- **Sortieren:** Standardmäßig nach Größe, größte zuerst. Über „Sort by“ (oder Klick auf einen Spaltenkopf) geht es
+  auch nach Name, Laufwerk, Hersteller oder Version; der Knopf daneben dreht die Reihenfolge um.
+- **Laufwerke:** Die Spalte „Drive“ zeigt, auf welcher Festplatte ein Programm liegt. Über „Drive“ lässt sich die Liste auf
+  ein Laufwerk beschränken; das Menü zeigt pro Laufwerk Anzahl und Gesamtgröße der Programme.
+- Programme, die ihre Größe nicht angeben, werden im Hintergrund vermessen (Größe des Installationsordners).
 
 ## Herunterladen / bauen
 

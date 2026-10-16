@@ -4,6 +4,7 @@
 //! [`system::RealSystem`] is platform independent and unit tested.
 
 pub mod cleaner;
+pub mod disk;
 pub mod engine;
 pub mod model;
 pub mod names;

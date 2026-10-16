@@ -77,6 +77,7 @@ pub struct Program {
     pub quiet_uninstall_string: String,
     pub size_kb: u32,
     pub install_date: String,
+    pub display_icon: String,
     pub windows_installer: bool,
 }
 
@@ -92,6 +93,7 @@ impl Program {
             quiet_uninstall_string: String::new(),
             size_kb: 0,
             install_date: String::new(),
+            display_icon: String::new(),
             windows_installer: false,
         }
     }

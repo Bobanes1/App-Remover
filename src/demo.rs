@@ -63,6 +63,23 @@ pub fn registry() -> FakeRegistry {
             "",
             "MsiExec.exe /X{3A8F2E5C-1B6D-4F7A-9C2E-8D4B6A1F3E7C}",
         ),
+        (
+            "Cyberpunk 2077",
+            "CD PROJEKT RED",
+            "2.13",
+            71_000_000,
+            r"D:\Games\Cyberpunk 2077",
+            r#""D:\Games\Cyberpunk 2077\unins000.exe""#,
+        ),
+        ("Steam", "Valve Corporation", "2.10.91.91", 0, r"D:\Steam", r#""D:\Steam\uninstall.exe""#),
+        (
+            "DaVinci Resolve",
+            "Blackmagic Design",
+            "19.0",
+            3_100_000,
+            r"E:\Video\DaVinci Resolve",
+            r#""E:\Video\DaVinci Resolve\uninstall.exe""#,
+        ),
     ];
     for (name, publisher, version, size, loc, un) in apps {
         reg.add(

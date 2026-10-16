@@ -158,6 +158,7 @@ pub fn list_programs(reg: &dyn Registry) -> Vec<Program> {
             p.quiet_uninstall_string = text(&v, "QuietUninstallString");
             p.size_kb = v.get("EstimatedSize").and_then(RegValue::as_u32).unwrap_or(0);
             p.install_date = text(&v, "InstallDate");
+            p.display_icon = text(&v, "DisplayIcon");
             p.windows_installer = v.get("WindowsInstaller").and_then(RegValue::as_u32) == Some(1);
             let ident = (p.name.to_lowercase(), p.version.clone(), p.uninstall_string.to_lowercase());
             if seen.insert(ident) {

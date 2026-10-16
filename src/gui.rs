@@ -1,13 +1,18 @@
 //! The window: a searchable program list, one Remove button, an activity log.
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use eframe::egui::{self, Align, Color32, Key, Layout, RichText, Sense};
 use egui_extras::{Column, TableBuilder};
 
+use app_remover::disk::{folder_size_kb, program_drive};
 use app_remover::engine::{backup_base, default_choice, remove_program, Options};
-use app_remover::model::{Confidence, Leftover, Program};
+use app_remover::model::{Confidence, Leftover, Program, RegKey};
 use app_remover::registry::list_programs;
+use app_remover::safety;
 
 use crate::Backend;
 
@@ -15,6 +20,8 @@ enum Msg {
     Log(String),
     Review(Vec<Leftover>, Sender<Vec<usize>>),
     Done,
+    /// Folder size measured in the background for a program the registry has no size for.
+    Size(RegKey, u32),
 }
 
 /// Sends `Done` even if the worker panics, so the window never stays "busy".
@@ -35,15 +42,45 @@ struct Review {
 
 #[derive(Clone, Copy, PartialEq)]
 enum SortBy {
+    Size,
     Name,
+    Drive,
     Publisher,
     Version,
-    Size,
 }
+
+impl SortBy {
+    const ALL: [SortBy; 5] = [SortBy::Size, SortBy::Name, SortBy::Drive, SortBy::Publisher, SortBy::Version];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortBy::Size => "Size",
+            SortBy::Name => "Name",
+            SortBy::Drive => "Drive",
+            SortBy::Publisher => "Publisher",
+            SortBy::Version => "Version",
+        }
+    }
+
+    /// Biggest first is what you want for sizes; A-Z / C: first for the rest.
+    fn default_descending(self) -> bool {
+        self == SortBy::Size
+    }
+}
+
+/// `None` = all drives, `Some(None)` = programs whose drive is unknown.
+type DriveFilter = Option<Option<String>>;
 
 pub struct App {
     b: Backend,
+    ctx: egui::Context,
     programs: Vec<Program>,
+    /// Drive of each program, parallel to `programs`.
+    drives: Vec<Option<String>>,
+    /// Sizes measured from the install folder when the registry has none.
+    measured: HashMap<RegKey, u32>,
+    measuring: HashSet<RegKey>,
+    drive_filter: DriveFilter,
     filter: String,
     selected: Option<usize>,
     sort: SortBy,
@@ -61,7 +98,11 @@ pub struct App {
 }
 
 fn size_text(kb: u32) -> String {
-    let mb = f64::from(kb) / 1024.0;
+    size_text_u64(u64::from(kb))
+}
+
+fn size_text_u64(kb: u64) -> String {
+    let mb = kb as f64 / 1024.0;
     match kb {
         0 => String::new(),
         _ if mb >= 1024.0 => format!("{:.1} GB", mb / 1024.0),
@@ -70,16 +111,33 @@ fn size_text(kb: u32) -> String {
     }
 }
 
+fn programs_text(n: usize) -> String {
+    if n == 1 {
+        "1 program".into()
+    } else {
+        format!("{n} programs")
+    }
+}
+
+fn drive_label(d: &Option<String>) -> &str {
+    d.as_deref().unwrap_or("unknown")
+}
+
 impl App {
-    fn new(b: Backend) -> Self {
+    fn new(b: Backend, ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
         let mut app = App {
             b,
+            ctx,
             programs: Vec::new(),
+            drives: Vec::new(),
+            measured: HashMap::new(),
+            measuring: HashSet::new(),
+            drive_filter: None,
             filter: String::new(),
             selected: None,
-            sort: SortBy::Name,
-            descending: false,
+            sort: SortBy::Size,
+            descending: true,
             silent: true,
             review: false,
             force: false,
@@ -101,7 +159,47 @@ impl App {
     fn refresh(&mut self) {
         let keep = self.selected.and_then(|i| self.programs.get(i)).map(|p| p.key.clone());
         self.programs = list_programs(self.b.reg.as_ref());
+        self.drives = self.programs.iter().map(program_drive).collect();
         self.selected = keep.and_then(|k| self.programs.iter().position(|p| p.key == k));
+        self.measure_missing_sizes();
+    }
+
+    /// Many programs don't record their size. Measure their install folder in the
+    /// background (like Revo does) so sorting by size is meaningful.
+    fn measure_missing_sizes(&mut self) {
+        let jobs: Vec<(RegKey, String)> = self
+            .programs
+            .iter()
+            .filter(|p| p.size_kb == 0 && !p.install_location.is_empty())
+            .filter(|p| !self.measured.contains_key(&p.key) && !self.measuring.contains(&p.key))
+            // never measure e.g. all of "C:\Program Files" because an entry points there
+            .filter(|p| !safety::is_protected_path(&p.install_location, &self.b.env.protected))
+            .filter(|p| Path::new(&p.install_location).is_dir())
+            .map(|p| (p.key.clone(), p.install_location.clone()))
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        self.measuring.extend(jobs.iter().map(|(k, _)| k.clone()));
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            for (key, loc) in jobs {
+                let kb = u32::try_from(folder_size_kb(Path::new(&loc))).unwrap_or(u32::MAX);
+                if tx.send(Msg::Size(key, kb)).is_err() {
+                    return; // window closed
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Registry size, or the measured folder size; the flag says it was measured.
+    fn size_of(&self, i: usize) -> (u32, bool) {
+        let p = &self.programs[i];
+        match (p.size_kb, self.measured.get(&p.key)) {
+            (0, Some(&kb)) => (kb, true),
+            (kb, _) => (kb, false),
+        }
     }
 
     /// Indices into `programs` that match the search, in display order.
@@ -112,17 +210,32 @@ impl App {
                 let p = &self.programs[i];
                 q.is_empty() || p.name.to_lowercase().contains(&q) || p.publisher.to_lowercase().contains(&q)
             })
+            .filter(|&i| self.drive_filter.as_ref().is_none_or(|d| *d == self.drives[i]))
             .collect();
         let ps = &self.programs;
-        match self.sort {
-            SortBy::Name => v.sort_by_key(|&i| ps[i].name.to_lowercase()),
-            SortBy::Publisher => v.sort_by_key(|&i| (ps[i].publisher.to_lowercase(), ps[i].name.to_lowercase())),
-            SortBy::Version => v.sort_by(|&a, &b| ps[a].version.cmp(&ps[b].version)),
-            SortBy::Size => v.sort_by_key(|&i| ps[i].size_kb),
-        }
-        if self.descending {
-            v.reverse();
-        }
+        let name = |i: usize| ps[i].name.to_lowercase();
+        let primary = |a: usize, b: usize| -> Ordering {
+            match self.sort {
+                SortBy::Size => self.size_of(a).0.cmp(&self.size_of(b).0),
+                SortBy::Name => name(a).cmp(&name(b)),
+                SortBy::Publisher => ps[a].publisher.to_lowercase().cmp(&ps[b].publisher.to_lowercase()),
+                SortBy::Version => ps[a].version.cmp(&ps[b].version),
+                // unknown drive sorts after every lettered drive
+                SortBy::Drive => {
+                    (self.drives[a].is_none(), &self.drives[a]).cmp(&(self.drives[b].is_none(), &self.drives[b]))
+                }
+            }
+        };
+        v.sort_by(|&a, &b| {
+            let o = primary(a, b);
+            let o = if self.descending { o.reverse() } else { o };
+            o.then_with(|| match self.sort {
+                // within a drive: biggest first
+                SortBy::Drive => self.size_of(b).0.cmp(&self.size_of(a).0),
+                _ => Ordering::Equal,
+            })
+            .then_with(|| name(a).cmp(&name(b)))
+        });
         v
     }
 
@@ -137,6 +250,10 @@ impl App {
                 Msg::Done => {
                     self.busy = None;
                     self.refresh();
+                }
+                Msg::Size(key, kb) => {
+                    self.measuring.remove(&key);
+                    self.measured.insert(key, kb);
                 }
             }
         }
@@ -170,7 +287,7 @@ impl App {
         });
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    fn top_bar(&mut self, ui: &mut egui::Ui, visible: &[usize]) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -218,14 +335,79 @@ impl App {
                 .on_hover_text("Run the program's uninstaller without its wizard where possible");
             ui.checkbox(&mut self.review, "Review leftovers before deleting");
             ui.checkbox(&mut self.force, "Force remove (skip its uninstaller)");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(format!("{} programs", self.programs.len()));
-                if self.b.demo {
+            if self.b.demo {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new("DEMO").color(Color32::from_rgb(220, 120, 0)).strong());
-                }
-            });
+                });
+            }
         });
+        ui.horizontal(|ui| self.sort_and_drive_bar(ui, visible));
         ui.add_space(4.0);
+    }
+
+    fn sort_and_drive_bar(&mut self, ui: &mut egui::Ui, visible: &[usize]) {
+        ui.label("Sort by");
+        egui::ComboBox::from_id_salt("sort").selected_text(self.sort.label()).width(100.0).show_ui(ui, |ui| {
+            for key in SortBy::ALL {
+                if ui.selectable_label(self.sort == key, key.label()).clicked() {
+                    self.sort = key;
+                    self.descending = key.default_descending();
+                }
+            }
+        });
+        let direction = match (self.sort, self.descending) {
+            (SortBy::Size, true) => "largest first",
+            (SortBy::Size, false) => "smallest first",
+            (_, false) => "A-Z",
+            (_, true) => "Z-A",
+        };
+        if ui.button(direction).on_hover_text("Reverse the order").clicked() {
+            self.descending = !self.descending;
+        }
+
+        ui.add_space(16.0);
+        ui.label("Drive");
+        // Programs and total size per drive, over the whole list.
+        let mut per_drive: Vec<(Option<String>, usize, u64)> = Vec::new();
+        for i in 0..self.programs.len() {
+            let kb = u64::from(self.size_of(i).0);
+            match per_drive.iter_mut().find(|(d, ..)| *d == self.drives[i]) {
+                Some(entry) => {
+                    entry.1 += 1;
+                    entry.2 += kb;
+                }
+                None => per_drive.push((self.drives[i].clone(), 1, kb)),
+            }
+        }
+        per_drive.sort_by(|a, b| (a.0.is_none(), &a.0).cmp(&(b.0.is_none(), &b.0)));
+        let current = match &self.drive_filter {
+            None => "All drives".to_string(),
+            Some(d) => drive_label(d).to_string(),
+        };
+        egui::ComboBox::from_id_salt("drive").selected_text(current).width(110.0).show_ui(ui, |ui| {
+            if ui.selectable_label(self.drive_filter.is_none(), "All drives").clicked() {
+                self.drive_filter = None;
+            }
+            for (drive, count, kb) in &per_drive {
+                let text = format!("{}   {}, {}", drive_label(drive), programs_text(*count), size_text_u64(*kb));
+                if ui.selectable_label(self.drive_filter.as_ref() == Some(drive), text).clicked() {
+                    self.drive_filter = Some(drive.clone());
+                }
+            }
+        });
+
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let total: u64 = visible.iter().map(|&i| u64::from(self.size_of(i).0)).sum();
+            let count = if visible.len() == self.programs.len() {
+                programs_text(visible.len())
+            } else {
+                format!("{} of {}", visible.len(), programs_text(self.programs.len()))
+            };
+            ui.label(format!("{count}, {}", size_text_u64(total)));
+            if !self.measuring.is_empty() {
+                ui.spinner().on_hover_text("Measuring the size of programs that don't report one");
+            }
+        });
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
@@ -261,6 +443,7 @@ impl App {
             (SortBy::Name, "Name"),
             (SortBy::Publisher, "Publisher"),
             (SortBy::Version, "Version"),
+            (SortBy::Drive, "Drive"),
             (SortBy::Size, "Size"),
         ];
 
@@ -271,6 +454,7 @@ impl App {
             .column(Column::remainder().at_least(180.0).clip(true))
             .column(Column::initial(220.0).at_least(80.0).clip(true).resizable(true))
             .column(Column::initial(110.0).at_least(60.0).clip(true).resizable(true))
+            .column(Column::initial(60.0).at_least(50.0))
             .column(Column::initial(80.0).at_least(60.0));
         if let Some(row) = scroll_to.and_then(|sel| visible.iter().position(|&i| i == sel)) {
             tb = tb.scroll_to_row(row, None);
@@ -306,7 +490,14 @@ impl App {
                     ui.label(&p.version);
                 });
                 row.col(|ui| {
-                    ui.label(size_text(p.size_kb));
+                    ui.label(drive_label(&self.drives[idx]));
+                });
+                let (kb, measured) = self.size_of(idx);
+                row.col(|ui| {
+                    let label = ui.label(size_text(kb));
+                    if measured {
+                        label.on_hover_text("Measured from the install folder (the program doesn't report its size)");
+                    }
                 });
                 let resp = row.response();
                 if resp.clicked() {
@@ -332,7 +523,7 @@ impl App {
                 self.descending = !self.descending;
             } else {
                 self.sort = key;
-                self.descending = key == SortBy::Size;
+                self.descending = key.default_descending();
             }
         }
     }
@@ -472,7 +663,7 @@ impl eframe::App for App {
         let confirm_was_open = self.confirm.is_some();
         let scroll_to = self.keyboard(&ctx, &visible);
 
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &visible));
         egui::Panel::bottom("log").resizable(true).default_size(170.0).min_size(70.0).show(ui, |ui| self.log_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             let visible = self.visible();
@@ -498,5 +689,5 @@ pub fn run(b: Backend) -> eframe::Result {
             .with_min_inner_size([640.0, 420.0]),
         ..Default::default()
     };
-    eframe::run_native(title, options, Box::new(move |_cc| Ok(Box::new(App::new(b)))))
+    eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(App::new(b, cc.egui_ctx.clone())))))
 }
