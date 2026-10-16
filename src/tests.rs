@@ -349,3 +349,19 @@ fn delete_does_not_follow_symlinks() {
     assert!(!Path::new(&f.loc).exists());
     assert!(Path::new(&p(&outside, &["keep.txt"])).exists());
 }
+
+#[test]
+fn finds_scheduled_task_in_utf16_xml() {
+    let mut f = fixture();
+    let tasks = p(&f.root, &["Tasks"]);
+    fs::create_dir_all(p(&tasks, &["Vendor"])).unwrap();
+    let xml = format!("<Task><Exec><Command>{}</Command></Exec></Task>", p(&f.loc, &["cc.exe"]));
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+    fs::write(p(&tasks, &["Vendor", "Updater"]), bytes).unwrap();
+    fs::write(p(&tasks, &["Unrelated"]), "<Task><Command>C:\\Other\\o.exe</Command></Task>").unwrap();
+    f.env.tasks_dir = tasks;
+    let found = scan_leftovers(&cc(&f), &f.env, f.reg.as_ref());
+    let found_tasks: Vec<_> = found.iter().filter(|i| i.kind == Kind::Task).map(|i| i.target.as_str()).collect();
+    assert_eq!(found_tasks, ["\\Vendor\\Updater"]);
+}

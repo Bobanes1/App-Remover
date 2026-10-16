@@ -253,8 +253,10 @@ fn read_task_xml(path: &Path) -> String {
     let Ok(raw) = fs::read(path) else { return String::new() };
     let utf16 = |le: bool| {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| if le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) })
             .collect();
         String::from_utf16_lossy(&units)
     };
