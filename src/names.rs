@@ -11,7 +11,31 @@ static CORP_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
 });
 static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"%([^%]+)%").unwrap());
 
-const GENERIC_DIRS: &[&str] = &["bin", "app", "application", "program", "programs", "x64", "x86", "win64", "win32"];
+const GENERIC_DIRS: &[&str] = &[
+    "bin",
+    "app",
+    "application",
+    "program",
+    "programs",
+    "x64",
+    "x86",
+    "win64",
+    "win32",
+    "temp",
+    "tmp",
+    "data",
+    "common",
+    "shared",
+    "cache",
+    "logs",
+    "users",
+    "public",
+    "files",
+    "install",
+    "setup",
+    "current",
+    "latest",
+];
 
 /// "7-Zip 23.01 (x64)" -> "7zip"
 pub fn normalize(text: &str) -> String {

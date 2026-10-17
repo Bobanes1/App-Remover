@@ -56,3 +56,33 @@ pub fn is_protected_key(key: &RegKey) -> bool {
     let low = key.path.trim_matches('\\').to_lowercase();
     PROTECTED_KEY_PATHS.contains(&low.as_str()) || !low.contains('\\')
 }
+
+/// Top-level folders on any drive that belong to Windows itself.
+const SYSTEM_TOP_DIRS: &[&str] = &[
+    "windows",
+    "$recycle.bin",
+    "system volume information",
+    "recovery",
+    "boot",
+    "efi",
+    "$windows.~bt",
+    "$windows.~ws",
+    "$winreagent",
+    "$sysreset",
+    "perflogs",
+];
+
+/// True if `path` lies anywhere inside a forbidden tree (e.g. C:\Windows) or inside a
+/// top-level Windows folder on any drive. Nothing in there is ever deleted, used to
+/// match leftovers, or has its processes stopped - unlike `is_protected_path`, which
+/// only guards a folder itself and its ancestors.
+pub fn is_forbidden(path: &str, forbidden: &[String]) -> bool {
+    if forbidden.iter().filter(|f| !f.is_empty()).any(|f| is_within(path, f)) {
+        return true;
+    }
+    let first = Path::new(path).components().find_map(|c| match c {
+        std::path::Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+        _ => None,
+    });
+    cfg!(windows) && first.is_some_and(|f| SYSTEM_TOP_DIRS.contains(&f.as_str()))
+}

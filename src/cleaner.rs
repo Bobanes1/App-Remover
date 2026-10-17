@@ -75,7 +75,7 @@ pub fn clean(
                 }
             },
             Kind::File | Kind::Dir => {
-                if safety::is_protected_path(&it.target, &env.protected) {
+                if !env.may_touch(&it.target) {
                     Err("refusing to delete a protected location".into())
                 } else {
                     let r = if fs::symlink_metadata(&it.target).is_ok() {
@@ -118,7 +118,7 @@ fn prune_empty_parent(path: &str, env: &Environment) {
         .chain(&env.shortcut_roots)
         .any(|r| safety::is_within(&parent_s, r) && safety::norm(&parent_s) != safety::norm(r));
     let empty = fs::read_dir(parent).map(|mut rd| rd.next().is_none()).unwrap_or(false);
-    if inside_root && empty && !safety::is_protected_path(&parent_s, &env.protected) {
+    if inside_root && empty && env.may_touch(&parent_s) {
         let _ = fs::remove_dir(parent);
     }
 }

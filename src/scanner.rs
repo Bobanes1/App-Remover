@@ -9,7 +9,7 @@ use std::path::{Path, MAIN_SEPARATOR};
 use crate::model::{Confidence, Hive, Kind, Leftover, Program, RegKey, RegValue};
 use crate::names::{basename_norm, expand_vars, normalize, publisher_variants};
 use crate::profiles::find_profile;
-use crate::registry::Registry;
+use crate::registry::{list_programs, Registry};
 use crate::safety;
 
 const RESERVED_KEYS: &[&str] = &[
@@ -37,7 +37,10 @@ pub struct Environment {
     /// Start menu and desktop folders.
     pub shortcut_roots: Vec<String>,
     pub tasks_dir: String,
+    /// Never deleted themselves, nor any of their parents.
     pub protected: Vec<String>,
+    /// Whole trees nothing may be deleted from (e.g. C:\Windows), see [`safety::is_forbidden`].
+    pub forbidden: Vec<String>,
     pub envvars: HashMap<String, String>,
 }
 
@@ -88,17 +91,73 @@ impl Environment {
             join(&home, &["Desktop"]),
             join(&home, &["Documents"]),
             join(&home, &["Downloads"]),
+            // personal folders and temp folders: never deleted as a whole
+            join(&local, &["Temp"]),
+            g("TEMP"),
+            join(&home, &["Pictures"]),
+            join(&home, &["Music"]),
+            join(&home, &["Videos"]),
+            join(&home, &["Favorites"]),
+            join(&home, &["Saved Games"]),
+            join(&home, &["OneDrive"]),
+            g("OneDrive"),
         ];
         protected.extend(shortcut_roots.iter().cloned());
+        let mut forbidden = vec![
+            sysroot.clone(),
+            join(&g("ProgramData"), &["Microsoft"]),
+            join(&pf, &["WindowsApps"]),
+            join(&pf, &["Windows Defender"]),
+            join(&pf86, &["Windows Defender"]),
+            join(&pf, &["Windows Defender Advanced Threat Protection"]),
+            join(&pf, &["Common Files", "microsoft shared"]),
+            join(&pf86, &["Common Files", "microsoft shared"]),
+            join(&local, &["Microsoft"]),
+            join(&local, &["Packages"]),
+            join(&g("APPDATA"), &["Microsoft"]),
+        ];
+        // App Remover's own folder: it must never delete itself.
+        if let Some(dir) =
+            std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_string_lossy().into_owned()))
+        {
+            forbidden.push(dir);
+        }
         let clean = |v: Vec<String>| v.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
         Environment {
             file_roots: clean(file_roots),
             shortcut_roots: clean(shortcut_roots),
             tasks_dir: join(&sysroot, &["System32", "Tasks"]),
             protected: clean(protected),
+            forbidden: clean(forbidden),
             envvars: std::env::vars().collect(),
         }
     }
+}
+
+impl Environment {
+    /// May App Remover delete this path (or stop processes running from it)?
+    pub fn may_touch(&self, path: &str) -> bool {
+        !safety::is_protected_path(path, &self.protected) && !safety::is_forbidden(path, &self.forbidden)
+    }
+}
+
+/// The program's install folder, if it is really its own: not a system or protected
+/// folder, and not a shared parent that other installed programs live in (e.g. an
+/// entry pointing at `D:\Games` while `D:\Games\Foo` is another program).
+/// Only this folder is deleted, used to recognise its services, tasks and startup
+/// entries, and has its processes stopped.
+pub fn own_install_folder(program: &Program, env: &Environment, reg: &dyn Registry) -> Option<String> {
+    let loc = program.install_location.trim().trim_end_matches(['\\', '/']);
+    if loc.is_empty() || !Path::new(loc).is_absolute() || !env.may_touch(loc) {
+        return None;
+    }
+    let shared = list_programs(reg).iter().any(|o| {
+        o.key != program.key
+            && !o.install_location.trim().is_empty()
+            && safety::is_within(o.install_location.trim(), loc)
+            && safety::norm(o.install_location.trim()) != safety::norm(loc)
+    });
+    (!shared).then(|| loc.to_string())
 }
 
 struct Info {
@@ -106,17 +165,32 @@ struct Info {
     /// Name minus publisher prefix: only trusted inside a publisher folder.
     stripped: HashSet<String>,
     publishers: HashSet<String>,
+    /// The program's own install folder, or "" if it has none we can trust.
     location: String,
+    /// Another installed program has the same name once versions are stripped
+    /// (e.g. "Python 3.11" and "Python 3.12"): name matches are then never certain.
+    ambiguous: bool,
 }
 
-fn info(program: &Program) -> Info {
+impl Info {
+    fn name_confidence(&self) -> Confidence {
+        if self.ambiguous {
+            Confidence::Medium
+        } else {
+            Confidence::High
+        }
+    }
+}
+
+fn info(program: &Program, location: Option<String>, reg: &dyn Registry) -> Info {
     let name = normalize(&program.name);
     let publishers = publisher_variants(&program.publisher);
     let mut names = HashSet::new();
     if name.len() >= 4 {
         names.insert(name.clone());
     }
-    let loc_name = basename_norm(&program.install_location);
+    let location = location.unwrap_or_default();
+    let loc_name = basename_norm(&location);
     if loc_name.len() >= 4 {
         names.insert(loc_name);
     }
@@ -126,7 +200,8 @@ fn info(program: &Program) -> Info {
         .filter(|rest| rest.len() >= 4)
         .map(str::to_string)
         .collect();
-    Info { names, stripped, publishers, location: program.install_location.clone() }
+    let ambiguous = list_programs(reg).iter().any(|o| o.key != program.key && normalize(&o.name) == name);
+    Info { names, stripped, publishers, location, ambiguous }
 }
 
 fn classify(n: &str, info: &Info, inside_publisher: bool) -> Option<Confidence> {
@@ -134,7 +209,7 @@ fn classify(n: &str, info: &Info, inside_publisher: bool) -> Option<Confidence> 
         return None;
     }
     if info.names.contains(n) {
-        return Some(Confidence::High);
+        return Some(info.name_confidence());
     }
     if inside_publisher && info.stripped.contains(n) {
         return Some(Confidence::Medium);
@@ -210,7 +285,7 @@ fn scan_registry(reg: &dyn Registry, info: &Info, out: &mut Vec<Leftover>) {
                 }
                 let key = base.child(&sub);
                 if info.names.contains(&n) {
-                    out.push(Leftover::reg_key(key, "key name matches app", Confidence::High));
+                    out.push(Leftover::reg_key(key, "key name matches app", info.name_confidence()));
                 } else if info.publishers.contains(&n) {
                     for child in reg.subkeys(&key) {
                         if let Some(c) = classify(&normalize(&child), info, true) {
@@ -311,16 +386,16 @@ fn scan_tasks(env: &Environment, info: &Info, out: &mut Vec<Leftover>) {
 }
 
 pub fn scan_leftovers(program: &Program, env: &Environment, reg: &dyn Registry) -> Vec<Leftover> {
-    let info = info(program);
+    let own = own_install_folder(program, env, reg);
+    let info = info(program, own.clone(), reg);
     let profile = find_profile(program);
     let mut out = Vec::new();
 
     if reg.exists(&program.key) {
         out.push(Leftover::reg_key(program.key.clone(), "Apps & Features entry", Confidence::High));
     }
-    let loc = &program.install_location;
-    if !loc.is_empty() && Path::new(loc).exists() {
-        out.push(fs_item(loc.clone(), Confidence::High, "install folder"));
+    if let Some(loc) = own.filter(|l| Path::new(l).exists()) {
+        out.push(fs_item(loc, Confidence::High, "install folder"));
     }
     if let Some(p) = profile {
         for raw in p.paths {
@@ -334,15 +409,25 @@ pub fn scan_leftovers(program: &Program, env: &Environment, reg: &dyn Registry) 
     scan_registry(reg, &info, &mut out);
     scan_services(reg, &info, profile.map_or(&[], |p| p.services), &mut out);
     scan_tasks(env, &info, &mut out);
-    finalize(out, env)
+    let others: Vec<String> = list_programs(reg)
+        .into_iter()
+        .filter(|o| o.key != program.key)
+        .map(|o| o.install_location.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    finalize(out, env, &others)
 }
 
-fn finalize(items: Vec<Leftover>, env: &Environment) -> Vec<Leftover> {
+/// `others`: install folders of the other installed programs; a folder holding
+/// one of them is never removed.
+fn finalize(items: Vec<Leftover>, env: &Environment, others: &[String]) -> Vec<Leftover> {
     let mut seen = HashSet::new();
     let unique: Vec<Leftover> = items
         .into_iter()
         .filter(|it| match it.kind {
-            Kind::File | Kind::Dir => !safety::is_protected_path(&it.target, &env.protected),
+            Kind::File | Kind::Dir => {
+                env.may_touch(&it.target) && !others.iter().any(|o| safety::is_within(o, &it.target))
+            }
             Kind::RegKey => !it.key.as_ref().is_some_and(safety::is_protected_key),
             _ => true,
         })

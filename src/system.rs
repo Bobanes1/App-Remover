@@ -5,6 +5,7 @@ use std::io;
 use std::path::Path;
 
 use crate::model::RegKey;
+use crate::safety;
 
 pub trait System: Send + Sync {
     fn kill_processes_in(&self, directory: &str);
@@ -87,21 +88,28 @@ fn reg_path(key: &RegKey) -> String {
 
 impl System for RealSystem {
     fn kill_processes_in(&self, directory: &str) {
-        let d = directory.trim_end_matches(['\\', '/']).replace('\'', "''");
-        if d.len() < 4 {
+        let dir = directory.trim();
+        if !Path::new(dir).is_absolute() || Path::new(dir).parent().is_none() {
             return;
         }
-        let script = format!(
-            "$d='{d}\\'; Get-Process | Where-Object {{ $_.Path -and \
-             $_.Path.StartsWith($d,[StringComparison]::OrdinalIgnoreCase) }} | \
-             Stop-Process -Force -ErrorAction SilentlyContinue"
-        );
-        run(&["powershell", "-NoProfile", "-NonInteractive", "-Command", &script]);
+        for (pid, _) in procs::list() {
+            if let Some(image) = procs::image_path(pid) {
+                if safety::is_within(&image, dir) && procs::may_stop(pid, &image) {
+                    procs::terminate(pid);
+                }
+            }
+        }
     }
 
     fn kill_process_names(&self, names: &[&str]) {
-        for n in names {
-            run(&["taskkill", "/F", "/T", "/IM", n]);
+        for (pid, exe) in procs::list() {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(&exe)) {
+                if let Some(image) = procs::image_path(pid) {
+                    if procs::may_stop(pid, &image) {
+                        procs::terminate(pid);
+                    }
+                }
+            }
         }
     }
 
@@ -140,15 +148,7 @@ impl System for RealSystem {
             Ok(()) => return Ok("removed".into()),
             Err(e) => e.to_string(),
         };
-        if !cfg!(windows) {
-            return Err(first);
-        }
-        // Take ownership / grant Administrators full control, then retry.
-        run(&["takeown", "/F", path, "/R", "/D", "Y"]);
-        run(&["icacls", path, "/grant", "*S-1-5-32-544:F", "/T", "/C", "/Q"]);
-        if force_remove(p).is_ok() {
-            return Ok("removed (after taking ownership)".into());
-        }
+        // Files still in use: let Windows delete them during the next restart.
         if schedule_delete_on_reboot(p) {
             return Ok("in use: will be deleted at next restart".into());
         }
@@ -214,5 +214,100 @@ impl System for NoopSystem {
     }
     fn delete_path(&self, _: &str) -> Result<String, String> {
         Ok("(demo) not deleted".into())
+    }
+}
+
+/// Running processes via the Windows API (no PowerShell / taskkill child processes).
+#[cfg(windows)]
+mod procs {
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    use crate::safety;
+
+    /// (pid, exe file name) of every running process.
+    pub fn list() -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        // SAFETY: plain Win32 calls; `entry` is a correctly sized, zero-initialised
+        // PROCESSENTRY32W and the snapshot handle is closed before returning.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return out;
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut more = Process32FirstW(snap, &mut entry) != 0;
+            while more {
+                let name = &entry.szExeFile;
+                let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                out.push((entry.th32ProcessID, String::from_utf16_lossy(&name[..len])));
+                more = Process32NextW(snap, &mut entry) != 0;
+            }
+            CloseHandle(snap);
+        }
+        out
+    }
+
+    /// Full path of a process's executable, if we may look at it.
+    pub fn image_path(pid: u32) -> Option<String> {
+        // SAFETY: the handle is checked for null and closed; `buf`/`len` describe a valid buffer.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = vec![0u16; 32_768];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
+            CloseHandle(h);
+            ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
+        }
+    }
+
+    /// Never stop App Remover itself, the kernel's pseudo-processes, or anything
+    /// running from the Windows folder - whatever an uninstall entry claims.
+    pub fn may_stop(pid: u32, image: &str) -> bool {
+        // SAFETY: no arguments, cannot fail.
+        let me = unsafe { GetCurrentProcessId() };
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        pid > 4 && pid != me && Path::new(image).is_absolute() && !safety::is_within(image, &sysroot)
+    }
+
+    pub fn terminate(pid: u32) -> bool {
+        // SAFETY: the handle is checked for null and closed.
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let ok = TerminateProcess(h, 1) != 0;
+            CloseHandle(h);
+            ok
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod procs {
+    pub fn list() -> Vec<(u32, String)> {
+        Vec::new()
+    }
+    pub fn image_path(_pid: u32) -> Option<String> {
+        None
+    }
+    pub fn may_stop(_pid: u32, _image: &str) -> bool {
+        false
+    }
+    pub fn terminate(_pid: u32) -> bool {
+        false
     }
 }

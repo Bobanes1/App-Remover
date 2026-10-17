@@ -207,6 +207,7 @@ fn fixture() -> Fixture {
         shortcut_roots: vec![menu.clone()],
         tasks_dir: String::new(),
         protected: vec![pf86.clone(), pd.clone(), local.clone(), menu.clone(), root.clone()],
+        forbidden: vec![p(&root, &["Windows"])],
         envvars: HashMap::from([
             ("ProgramFiles(x86)".into(), pf86.clone()),
             ("ProgramData".into(), pd.clone()),
@@ -393,5 +394,119 @@ fn folder_size_counts_files_but_not_links() {
         std::os::unix::fs::symlink(&f.photoshop, p(&f.loc, &["link"])).unwrap();
         fs::write(p(&f.photoshop, &["huge.bin"]), vec![0u8; 50_000]).unwrap();
         assert_eq!(crate::disk::folder_size_kb(Path::new(&f.loc)), 5);
+    }
+}
+
+fn add_program(reg: &FakeRegistry, name: &str, loc: &str) {
+    reg.add(
+        Hive::Hklm,
+        &format!("{UNINSTALL_PATH}\\{name}"),
+        64,
+        &[("DisplayName", s(name)), ("InstallLocation", s(loc))],
+    );
+}
+
+fn named(reg: &FakeRegistry, name: &str) -> Program {
+    list_programs(reg).into_iter().find(|p| p.name == name).unwrap()
+}
+
+fn remove_default(f: &Fixture, prog: &Program) -> (crate::engine::Report, RecordingSystem) {
+    let sys = RecordingSystem::new(f.reg.clone());
+    let r = remove_program(
+        prog,
+        &f.env,
+        f.reg.as_ref(),
+        &sys,
+        &Options::default(),
+        &|_| {},
+        &|items| default_choice(items, false),
+        Path::new(&p(&f.root, &["bk"])),
+    );
+    (r, sys)
+}
+
+/// An entry claiming C:\Windows\System32 as its install folder must not make App
+/// Remover delete System32, Windows services running from it, or stop its processes.
+#[test]
+fn system_folder_install_location_is_never_touched() {
+    let f = fixture();
+    let sys32 = p(&f.root, &["Windows", "System32"]);
+    fs::create_dir_all(&sys32).unwrap();
+    fs::write(p(&sys32, &["kernel.dll"]), "x").unwrap();
+    add_program(&f.reg, "Some Driver", &sys32);
+    f.reg.add(
+        Hive::Hklm,
+        r"SYSTEM\CurrentControlSet\Services\Dhcp",
+        64,
+        &[("ImagePath", s(&p(&sys32, &["svchost.exe -k x"])))],
+    );
+    f.reg.add(
+        Hive::Hkcu,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        64,
+        &[("SecurityHealth", s(&p(&sys32, &["sh.exe"])))],
+    );
+    let prog = named(&f.reg, "Some Driver");
+    let found = scan_leftovers(&prog, &f.env, f.reg.as_ref());
+    let labels: Vec<String> = found.iter().map(Leftover::label).collect();
+    assert_eq!(labels, [format!("HKLM\\{UNINSTALL_PATH}\\Some Driver")], "only its own Apps & Features entry");
+    let (_, sys) = remove_default(&f, &prog);
+    assert!(Path::new(&p(&sys32, &["kernel.dll"])).exists());
+    assert!(!sys.calls().iter().any(|c| c.starts_with("kill_in") || c.starts_with("svc")), "{:?}", sys.calls());
+}
+
+/// An entry pointing at a folder that holds other programs (D:\Games) must not take them with it.
+#[test]
+fn shared_parent_folder_is_kept() {
+    let f = fixture();
+    let games = p(&f.root, &["Games"]);
+    let other = p(&games, &["Some Game"]);
+    fs::create_dir_all(&other).unwrap();
+    add_program(&f.reg, "Game Launcher", &games);
+    add_program(&f.reg, "Some Game", &other);
+    let prog = named(&f.reg, "Game Launcher");
+    let found = scan_leftovers(&prog, &f.env, f.reg.as_ref());
+    assert!(!found.iter().any(|i| i.target == games), "{found:#?}");
+    let (_, sys) = remove_default(&f, &prog);
+    assert!(Path::new(&other).is_dir());
+    assert!(!sys.calls().iter().any(|c| c.starts_with("kill_in")));
+}
+
+/// "Python 3.11" and "Python 3.12" both normalise to "python": removing one must
+/// not delete folders or keys the other one needs.
+#[test]
+fn same_name_other_version_survives() {
+    let f = fixture();
+    let local = f.env.file_roots[2].clone();
+    let py311 = p(&local, &["Python", "Python311"]);
+    let py312 = p(&local, &["Python", "Python312"]);
+    fs::create_dir_all(&py311).unwrap();
+    fs::create_dir_all(&py312).unwrap();
+    add_program(&f.reg, "Python 3.11.4 (64-bit)", &py311);
+    add_program(&f.reg, "Python 3.12.1 (64-bit)", &py312);
+    f.reg.add(Hive::Hkcu, r"Software\Python\PythonCore\3.12", 64, &[]);
+    let prog = named(&f.reg, "Python 3.11.4 (64-bit)");
+    let found = scan_leftovers(&prog, &f.env, f.reg.as_ref());
+    let py_key = found.iter().find(|i| i.label() == r"HKCU\Software\Python").expect("key is listed");
+    assert_eq!(py_key.confidence, Confidence::Medium, "shared name: only offered, never automatic");
+    remove_default(&f, &prog);
+    assert!(!Path::new(&py311).exists(), "its own folder goes");
+    assert!(Path::new(&py312).is_dir(), "the other version stays");
+    assert!(f.reg.exists(&RegKey::new(Hive::Hkcu, r"Software\Python\PythonCore\3.12", 64)));
+}
+
+#[test]
+fn forbidden_trees() {
+    let root = if cfg!(windows) { r"C:\" } else { "/" };
+    let win = Path::new(root).join("Windows").to_string_lossy().into_owned();
+    let deep = Path::new(&win).join("System32").join("drivers").to_string_lossy().into_owned();
+    let app = Path::new(root).join("Apps").join("X").to_string_lossy().into_owned();
+    let forbidden = vec![win.clone()];
+    assert!(safety::is_forbidden(&win, &forbidden));
+    assert!(safety::is_forbidden(&deep, &forbidden));
+    assert!(!safety::is_forbidden(&app, &forbidden));
+    if cfg!(windows) {
+        assert!(safety::is_forbidden(r"D:\Windows\System32", &[]), "Windows folder on any drive");
+        assert!(safety::is_forbidden(r"E:\System Volume Information\x", &[]));
     }
 }

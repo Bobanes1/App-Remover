@@ -6,7 +6,7 @@ use crate::cleaner::{self, CleanResult};
 use crate::model::{Confidence, Kind, Leftover, Program};
 use crate::profiles::find_profile;
 use crate::registry::Registry;
-use crate::scanner::{scan_leftovers, Environment};
+use crate::scanner::{own_install_folder, scan_leftovers, Environment};
 use crate::system::System;
 use crate::uninstall;
 
@@ -62,10 +62,17 @@ pub fn remove_program(
     let mut report = Report::default();
     let profile = find_profile(program);
 
+    let own_folder = own_install_folder(program, env, reg);
+    if own_folder.is_none() && !program.install_location.trim().is_empty() {
+        log(&format!(
+            "Note: its install location '{}' is a system or shared folder; it will not be touched.",
+            program.install_location.trim()
+        ));
+    }
     if !opts.dry_run {
         log("Stopping the program's processes...");
-        if !program.install_location.is_empty() {
-            sys.kill_processes_in(&program.install_location);
+        if let Some(folder) = &own_folder {
+            sys.kill_processes_in(folder);
         }
         if let Some(p) = profile {
             sys.kill_process_names(p.processes);

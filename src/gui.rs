@@ -12,7 +12,6 @@ use app_remover::disk::{folder_size_kb, program_drive};
 use app_remover::engine::{backup_base, default_choice, remove_program, Options};
 use app_remover::model::{Confidence, Leftover, Program, RegKey};
 use app_remover::registry::list_programs;
-use app_remover::safety;
 
 use crate::Backend;
 
@@ -173,7 +172,7 @@ impl App {
             .filter(|p| p.size_kb == 0 && !p.install_location.is_empty())
             .filter(|p| !self.measured.contains_key(&p.key) && !self.measuring.contains(&p.key))
             // never measure e.g. all of "C:\Program Files" because an entry points there
-            .filter(|p| !safety::is_protected_path(&p.install_location, &self.b.env.protected))
+            .filter(|p| self.b.env.may_touch(&p.install_location))
             .filter(|p| Path::new(&p.install_location).is_dir())
             .map(|p| (p.key.clone(), p.install_location.clone()))
             .collect();
@@ -315,7 +314,9 @@ impl App {
                             })
                             .collect()
                     });
-                    if !typed.trim().is_empty() {
+                    // A leading space is ignored (it may just toggle a focused checkbox),
+                    // spaces inside a search term are kept.
+                    if !typed.trim().is_empty() || (!typed.is_empty() && !self.filter.is_empty()) {
                         self.filter.push_str(&typed);
                         resp.request_focus();
                         // Put the cursor after the text, so the next keystrokes append.
@@ -403,7 +404,7 @@ impl App {
             } else {
                 format!("{} of {}", visible.len(), programs_text(self.programs.len()))
             };
-            ui.label(format!("{count}, {}", size_text_u64(total)));
+            ui.label(if total == 0 { count } else { format!("{count}, {}", size_text_u64(total)) });
             if !self.measuring.is_empty() {
                 ui.spinner().on_hover_text("Measuring the size of programs that don't report one");
             }
@@ -686,7 +687,12 @@ pub fn run(b: Backend) -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size([980.0, 660.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_min_inner_size([640.0, 420.0])
+            .with_icon(egui::IconData {
+                rgba: include_bytes!("../assets/icon64.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
     eframe::run_native(title, options, Box::new(move |cc| Ok(Box::new(App::new(b, cc.egui_ctx.clone())))))
